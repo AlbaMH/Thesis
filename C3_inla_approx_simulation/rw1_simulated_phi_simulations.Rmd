@@ -1,0 +1,707 @@
+---
+
+title: "GDM approximation simulation study"
+output: html_document
+---
+
+```{r packages, include=FALSE}
+# Load required libraries:
+library(INLA)
+library(ggplot2)
+library(tidyverse)
+library(nimble)
+library(mgcv)
+library(coda)
+library(compositions)
+library(reshape2)
+library(parallel)
+library(doParallel)
+library(abind)
+
+# expit function 
+expit<- function(x){exp(x)/(1+exp(x))}
+
+# Function for half-normal priors in INLA.
+half_normal_sd <- function(sigma){
+  return(
+    paste("expression:
+              sigma = ",sigma,";
+              precision = exp(log_precision);
+              logdens = -0.5*log(2*pi*sigma^2)-1.5*log_precision-1/(2*precision*sigma^2);
+              log_jacobian = log_precision;
+              return(logdens+log_jacobian);",sep='')
+  )
+} 
+
+```
+
+
+## Simulate data 
+
+
+```{r sim data }
+
+
+# Set simulation parameters:
+D <- 5# Maximum number of delays is 7.
+n <- 100 # Length of simulated time series.
+S <- 3
+
+# Number of simulations.
+n_sims<-100
+
+# Set random seeds.
+seeds<-runif(n_sims,0,9999999999)
+
+# Set maximum COVID-19 lab report delay.
+n_cores<-min(detectCores(),n_sims,25)
+
+# Data simulation function R script.
+# source("~/media/alba/Disk 1/OneDrive/PhD/Thesis code/Chapter 4 GDM efficiency/Section1_GDM approximation/data_sim_function.R", echo=TRUE)
+
+# Make Cluster for MCMC.
+this_cluster_simulation_data<- makeCluster(n_cores)
+
+# Run Cluster.
+time_data_gen <- system.time({
+  test <-  parLapply(cl = this_cluster_simulation_data, X = seeds,
+                                     fun = Simulation_data,
+                                     S=S,
+                                     N=n,
+                                     D=D)
+})
+
+# Stop Cluster.
+stopCluster(this_cluster_simulation_data)
+
+# Save data simulations:
+save(test,time_data_gen,file="Simulation_data_GDMapprox.RData")
+
+
+
+
+```
+
+## INLA Negative-Binomial model
+This INLA model fits each of the partial counts as Negative-Binomial, these are them summed at each time point to produce a prediction for the total counts.
+
+\begin{equation}
+z_{t,d} \sim NB(\mu_{t,d}, \theta) \\
+log(\mu_{t,d}) = \iota + \beta_{t,d} + \alpha_t + \pi_d *t \\
+\alpha_t \sim N(2*\alpha_{t-1}-\alpha_{t-2}, \sigma^2_{\alpha})\\
+\beta_{t,d} \sim N(\beta_{t-1,d}, \sigma^2_{\beta})\\
+\end{equation}
+Here \alpha is $2^{nd}$ order random walk and \beta is a $1^{st}$ order random walk.
+
+
+```{r INLA NB, message=FALSE}
+
+y_pred_NB<-phi_values_NB<-list()
+for(sims in 1:n_sims){
+  
+y <- test[[sims]]$y
+long_y<-melt(y)
+colnames(long_y)<-c("t","s","y")
+z <- abind(test[[sims]]$z[,,1:D],test[[sims]]$y-apply((test[[sims]]$z[,,1:D]),c(1,2),sum), along=3)
+
+# Set up data:
+Z<-z
+for(s in 1:S){
+  Z[,s,][outer(1:dim(Z[,s,])[1], 0:(dim(Z[,s,])[2]-1), FUN = "+") > n] <- NA
+}
+
+n_delay <- dim(Z)[3]
+N <- n_delay*n
+n.sim <- 10000 # Number of posterior samples
+
+y_pred<-list()
+for(s in 1:S){
+z_long<-melt(Z[,s,])
+colnames(z_long)<-c('time', 'delay', 'cases')
+
+# Save as data frame.
+inla.data <- data.frame(Y=z_long$cases,t=as.numeric(z_long$time),tt=as.numeric(z_long$time),
+                        ttt=as.numeric(z_long$time), d=as.numeric(z_long$delay),
+                        dd=as.numeric(z_long$delay),
+                        ddd=as.numeric(z_long$delay),
+                        i=as.numeric(z_long$time),j=1:N,
+                        n=c(1:(n_delay*n)))
+
+# INLA model formula.
+model <- Y ~ 1 +
+  f(d, model = "rw1", constr=T, hyper = list("prec" = list(prior = half_normal_sd(1)))) +
+  f(t, model = "rw2", constr= T, hyper = list("prec" = list(prior = half_normal_sd(0.1)))) +
+  f(dd,t,model="iid",constr=T, hyper = list("prec" = list(prior = half_normal_sd(1))))
+
+
+
+output <- inla(model, family = "nbinomial", data = inla.data,
+               control.predictor = list(link = 1, compute = T),
+               control.compute = list( config = T, waic=TRUE, dic=TRUE),
+               control.family = list( 
+                   hyper = list("theta" = list(prior = "loggamma", param = c(1, 0.1)))))
+
+
+index.missing<-which(is.na(inla.data$Y))
+delay.samples.list <- inla.posterior.sample(n = n.sim, output) # Posterior samples list
+
+# Sampling the missing partial counts from inla - output in vector format
+vector.samples <- lapply(X = delay.samples.list, 
+                          FUN = function(x, idx = index.missing) rnbinom(n = idx, mu = exp(x$latent[idx]),
+                                                                         size = x$hyperpar[1])) 
+
+
+tibble.samples <- lapply( X = vector.samples,
+                          FUN = function(x){
+                            data.aux <- inla.data
+                            data.aux$Y[index.missing] <- x
+                            data.aggregated <- data.aux %>% 
+                              group_by(tt) %>% summarise( Y = sum(Y) )
+                            data.aggregated
+                          }
+)
+
+y_pred[[s]] <- bind_rows(tibble.samples)
+
+y_pred[[s]] <- y_pred[[s]] %>% group_by(tt) %>% 
+  summarise( Median = mean(Y), 
+             q025 = quantile(Y, probs = 0.025),
+             q975 = quantile(Y, probs = 0.975))
+}
+#plot nowcasts and forecast
+
+y_pred_NB[[sims]]<-unlist(y_pred)%>%array(c(dim(y_pred[[1]]),S))%>%apply(2,c)%>%as.tibble()%>%
+  mutate(s=sort(rep(1:S,n)))
+colnames(y_pred_NB[[sims]])[1:5]<-c("t",colnames(y_pred[[1]])[2:4],"s")
+phi_values_NB[[sims]]<-test[[sims]]$phi
+y_pred_NB[[sims]]<-full_join(y_pred_NB[[sims]],long_y, by=c("t","s"))%>%mutate(Model="NB INLA")
+
+}
+
+save(y_pred_NB, file="NB_predictions.RData")
+
+INLA.NB<-ggplot(data=y_pred_NB[[1]])+  #geom_line(data=data.frame(t=1:n,y=lambda),aes(x=t,y=y))+
+  facet_wrap(~s)+
+  geom_ribbon(aes(x=t,ymin=q025 ,ymax=q975),alpha=0.2, fill='dark green')+
+  geom_line(aes(x=t,y=Median), colour='dark green')+
+  geom_point(aes(x=t,y=y))+
+  labs(x='Time',y='y', caption='INLA NB of the partial counts')
+INLA.NB
+
+# INLA.NB<-ggplot()+  geom_line(data=data.frame(t=1:n,y=lambda),aes(x=t,y=y))+
+#   geom_ribbon(aes(x=c(1:n),ymin=y_pred$q025 ,ymax=y_pred$q975),alpha=0.2, fill='dark green')+
+#   geom_line(aes(x=c(1:n),y=y_pred$Median), colour='dark green')+
+#   geom_point(data=data.frame(t=1:n,y=y),aes(x=t,y=y))+
+#   labs(x='Time',y='y', caption='INLA NB of the partial counts')
+
+#plot(output)
+```
+
+
+## INLA (Gaussian) GDM approximation
+
+This is the first version of the a GDM approximation fit with INLA, the model has the following structure:
+\begin{equation}
+<!-- y_t \sim N(\lambda_t, \sigma^2_y) \\ -->
+<!-- log(\lambda_t,) = \alpha_t + \theta_t\\ -->
+z_{t,d} \sim Poisson(\mu_{t,d}) \\
+log(\mu_{t,d}) =  \alpha_t + \theta_t + gd_{t,d} + \beta_{t,d} \\
+\alpha_t \sim N(2*\alpha_{t-1}-\alpha_{t-2}, \sigma^2_{\alpha})\\
+\beta_{t,d} \sim N(\beta_{t-1,d}, \sigma^2_{\beta})\\
+\sigma^2_{\beta}\sim \frac{1}{half-Normal(0,sd=1)} \\
+\sigma^2_{\alpha} \sim \frac{1}{half-Normal(0,sd=0.1)} \\
+
+<!-- \sigma^2_y \sim \frac{1}{half-Normal(0,100)} -->
+\end{equation}
+The temporal trend of the total counts are rw2 random effect and the temporal trends in the partial counts rw1 random effects and independent for each delay and there is a iid3d random effect to capture the negative covariance in the partial counts over delay.
+
+```{r Guass}
+
+y_pred_approx<-list()
+phi_values_approx<-list()
+for(sims in 1:n_sims){
+  
+  y <- test[[sims]]$y
+long_y<-melt(y)
+colnames(long_y)<-c("t","s","y")
+z <- abind(test[[sims]]$z[,,1:D],test[[sims]]$y-apply((test[[sims]]$z[,,1:D]),c(1,2),sum), along=3)
+
+# Set up data:
+Z<-z
+for(s in 1:S){
+  Z[,s,][outer(1:dim(Z[,s,])[1], 0:(dim(Z[,s,])[2]-1), FUN = "+") > n] <- NA
+}
+
+n_delay <- dim(Z)[3]
+N <- n_delay*n
+n.sim <- 10000 # Number of posterior samples
+
+y_pred_2<-list()
+for(s in 1:S){
+z_long<-melt(Z[,s,])
+colnames(z_long)<-c('time', 'delay', 'cases')
+
+# Save as data frame.
+inla.data <- data.frame(Y=z_long$cases,t=as.numeric(z_long$time),tt=as.numeric(z_long$time),
+                        ttt=as.numeric(z_long$time), d=as.numeric(z_long$delay),
+                        dd=as.numeric(z_long$delay),
+                        ddd=as.numeric(z_long$delay),
+                        i=as.numeric(z_long$time),j=1:N,
+                        n=c(1:(n_delay*n)))
+
+delay_formula <- Y ~ 1 +
+  f(i,model="iid",constr=T,hyper = list("prec" = list(prior = half_normal_sd(0.1)))) + # totals varaibility
+  f(j,model='iid3d',n=N,constr=T) +
+  # GD variability in partial counts?]
+  f(d, model = "rw1", constr=T, hyper = list("prec" = list(prior = half_normal_sd(1)))) +
+  # positive (gamma) variability in partial counts
+  f(t, model = "rw2", constr= T, hyper = list("prec" = list(prior = half_normal_sd(0.1)))) +
+  # trend in totals 
+  f(dd,t,model="iid",constr=T, hyper = list("prec" = list(prior = half_normal_sd(1))))
+# linear trend in delay
+
+delay_model <- inla(delay_formula,family="poisson",data=inla.data,
+                    control.predictor = list(compute=TRUE,link=1),
+                    control.family=list(list(link='log')),
+                    control.compute=list(config = TRUE))
+
+n.sim <- 10000 # Number of posterior samples
+
+delay.samples.list_2 <- inla.posterior.sample(n = n.sim, delay_model) # Posterior samples list
+
+# Sampling the missing partial counts from inla - output in vector format
+vector.samples_2 <- lapply(X = delay.samples.list_2, 
+                          FUN = function(x, idx = index.missing) rpois(n = idx,  exp(x$latent[idx]))) 
+
+
+tibble.samples_2 <- lapply( X = vector.samples_2,
+                          FUN = function(x){
+                            data.aux <- inla.data
+                            data.aux$Y[index.missing] <- x
+                            data.aggregated <- data.aux %>% 
+                              group_by(tt) %>% summarise( Y = sum(Y) )
+                            data.aggregated
+                          }
+)
+
+y_pred_2[[s]] <- bind_rows(tibble.samples_2)
+
+y_pred_2[[s]] <- y_pred_2[[s]] %>% group_by(tt) %>% 
+  summarise( Median = mean(Y), 
+             q025 = quantile(Y, probs = 0.025),
+             q975 = quantile(Y, probs = 0.975))
+}
+
+y_pred_approx[[sims]]<-unlist(y_pred_2)%>%array(c(dim(y_pred_2[[1]]),S))%>%apply(2,c)%>%as.tibble()%>%
+  mutate(s=sort(rep(1:S,n)))
+colnames(y_pred_approx[[sims]])[1:5]<-c("t",colnames(y_pred_2[[1]])[2:4],"s")
+phi_values_approx[[sims]]<-test[[sims]]$phi
+y_pred_approx[[sims]]<-full_join(y_pred_approx[[sims]],long_y, by=c("t","s"))%>%mutate(Model="GDM approximation INLA")
+}
+
+save(y_pred_approx, file="approx_predictions.RData")
+
+
+INLA.NB.approx<-ggplot(data=y_pred_approx[[1]])+  #geom_line(data=data.frame(t=1:n,y=lambda),aes(x=t,y=y))+
+  facet_wrap(~s, scales="free")+
+  geom_ribbon(aes(x=t,ymin=q025 ,ymax=q975, fill=Model),alpha=0.2)+
+  geom_line(aes(x=t,y=Median, colour=Model))+
+  geom_point(aes(x=t,y=y))+
+  labs(x='Time',y='y', caption='INLA NB of the partial counts')
+INLA.NB.approx
+
+# test_plot <- ggplot()+  geom_line(data=data.frame(t=1:n,y=test$lambda),aes(x=t,y=y))+
+#   geom_ribbon(aes(x=c(1:n),ymin=y_pred[[s]]$q025 ,ymax=y_pred[[s]]$q975, fill='NB INLA'),alpha=0.2)+
+#   geom_line(aes(x=c(1:n),y=y_pred$Median, colour='NB INLA'))+
+#   geom_ribbon(aes(x=c(1:n),ymin=y_pred_2[[s]]$q025 ,ymax=y_pred_2$q975, fill='GDM approximation INLA'),alpha=0.2)+
+#   geom_line(aes(x=c(1:n),y=y_pred_2$Median, colour='GDM approximation INLA'))+
+#   geom_point(data=data.frame(t=1:n,y=y),aes(x=t,y=y))+
+#   labs(x='Time',y='y', caption='INLA NB of the partial counts')+
+#   theme(legend.position = "bottom")+
+#   scale_color_viridis_d(name="Model",option="A", end=0.75)+
+#     scale_fill_viridis_d(name="Model",option="A", end=0.75)+
+#   theme_minimal()
+# #ggsave(test_plot,file="test_plot.pdf",width=8,height=6)
+# test_plot
+
+```
+
+
+
+
+
+
+
+## The GDM Model
+
+The Generalized-Dirichlet-Multinomial model with rw1 random effects for the temporal trend in y, and the temporal trend in partial counts for each delay.
+\begin{equation} 
+y_t \sim NB(\lambda_t, \theta) \\
+log(\lambda_t,) = \iota + \alpha_t \\
+z_{t,d}|y_t \sim Beta-Binomial(\mu_{t,d}, \phi, y_{t}^\ast) \\
+logit(\mu_{t,d}) = \psi_d + \beta_{t,d} \\
+\alpha_t \sim N(2*\alpha_{t-1}-\alpha{t-2}, \sigma^2_{\alpha})\\
+\beta_{t,d} \sim N(\beta_{t-1,d}, \sigma^2_{\beta})\\
+\sigma^2_{\beta}, \sigma^2_{\alpha} \sim \frac{1}{half-Normal(0,sd=0.1)} 
+\end{equation}
+
+```{r functions, include=FALSE}
+
+# Functions for NIMBLE:
+
+dbetabin=nimbleFunction(run=function(x=double(0),mu=double(0),phi=double(0),size=double(0),log=integer(0)){
+  returnType(double(0))
+  if(x>=0&x<=size){
+    return(lgamma(size+1)+lgamma(x+mu*phi)+lgamma(size-x+(1-mu)*phi)+lgamma(phi)-
+             lgamma(size+phi)-lgamma(mu*phi)-lgamma((1-mu)*phi)-lgamma(size-x+1)-lgamma(x+1))
+  }else{
+    return(-Inf)
+  }
+})
+
+rbetabin=nimbleFunction(run=function(n=integer(0),mu=double(0),phi=double(0),size=double(0)){
+  pi=rbeta(1,mu*phi,(1-mu)*phi)
+  returnType(double(0))
+  return(rbinom(1,size,pi))
+})
+
+# Register the Beta-Binomial as a distribution 
+registerDistributions(list(dbetabin=list(
+  BUGSdist='dbetabin(mu,phi,size)',discrete=TRUE)))
+
+
+half_normal_sd <-function(sigma){
+  return(
+    paste("expression:
+              sigma = ",sigma,";
+              precision = exp(log_precision);
+              logdens = -0.5*log(2*pi*sigma^2)-1.5*log_precision-1/(2*precision*sigma^2);
+              log_jacobian = log_precision;
+              return(logdens+log_jacobian);",sep='')
+  )
+}
+
+
+```
+
+```{r GDM model, message=FALSE, warning=FALSE}
+#constants
+#D<-3 #maximum delays
+n<-100 # time series 
+C<-94 # start of nowcast 
+D <- 5 # Maximum number of delays.
+n <- 100 # Length of simulated time series.
+S <- 3
+n_knots<-5
+time<-(c(1:n)-mean(c(1:n)))/sd(c(1:n))
+n_sims<-100
+# Set up the splines using jagam.
+blank_data=data_frame(y=rnorm(n,0,1),t=1:n)
+blank_jagam=jagam(y~s(t,bs='cs',k=n_knots[1]),data=blank_data,file='blank.jags',
+                  knots=list(t=seq(1,n,length=n_knots)))
+
+  nimble_code2 <- nimbleCode({
+    for(s in 1:S){
+      for(t in 1:n){
+        # Model for the mean
+        log(lambda[t,s]) <-iota[s] + alpha_rw2[t,s]
+        for(d in 1:D){
+          # Beta-Binomial means
+          mu[t,s,d] <- expit(psi[s,d]+beta_rw1[t,s,d]+pi[s,d]*time[t])
+          # Expected cumulative proportions.
+          # probit(p[t,d]) <- psi[d]+beta_spline[t,d]
+        }
+      }
+      
+      # Relative proportions (Beta-Binomial means).
+      #mu[t,1] <- p[t,1]
+      #for(d in 2:D){
+      #mu[t,d] <- (p[t,d]-p[t,d-1])/(1-p[t,d-1])
+      #}
+      
+      for(t in 1:n){
+        # Model for total deaths.
+        y[t,s] ~ dnbinom(prob=theta[s]/(theta[s]+lambda[t,s]), size=theta[s])
+        # Model for partial reports.
+        z[t,s,1] ~ dbetabin(mu=mu[t,s,1],phi=phi[s,1],size=y[t,s])
+        for(d in 2:D){
+          z[t,s,d] ~ dbetabin(mu=mu[t,s,d],phi=phi[s,d],size=y[t,s]-sum(z[t,s,1:(d-1)]))
+        }}
+      
+      alpha_rw2[1,s] ~ dnorm(0,1/prec_alpha[s])
+      alpha_rw2[2,s] ~ dnorm(0,1/prec_alpha[s])
+      for(t in 3:n){
+        alpha_rw2[t,s] ~ dnorm(2*alpha_rw2[(t-1),s]-alpha_rw2[(t-2),s],1/prec_alpha[s]) # 
+      }
+      for(d in 1:D){
+        beta_rw1[1,s,d] ~ dnorm(0,1/prec_beta[s]) 
+      }
+      for(t in 2:n){
+        for(d in 1:D){
+          beta_rw1[t,s,d] ~ dnorm(beta_rw1[t-1,s,d],1/prec_beta[s]) 
+        }
+      }
+      for(d in 1:D){
+        phi[s,d] ~ dgamma(2,0.02) # Beta-Binomial dispersion parameters.
+      }
+      for(d in 1:D){
+        psi[s,d] ~ dnorm(0,sd=10) # Delay counts intercept.
+        pi[s,d] ~ dnorm(0,1/prec_pi[s]) 
+      }
+      theta[s] ~ dgamma(2,0.02) # Negative-Binomial dispersion parameters.
+      iota[s] ~ dnorm(0,sd=10) # Total counts intercept.
+      #random walk sd priors
+      prec_pi[s] ~ T(dnorm(0,sd=1),0,)
+      prec_alpha[s] ~ T(dnorm(0,sd=0.1),0,)
+      prec_beta[s] ~ T(dnorm(0,sd=0.1),0,)
+    }
+  })
+  
+  n_iter <- 200000
+  n_chains <- 2
+  n_burnin <- 100000
+  n_thin <- 10 # Thin the MCMC samples by 10 
+  n_samples <- (n_iter-n_burnin)*n_chains/n_thin
+  
+  nimble_const<-list(n=n, D=D, S=S)
+  nimble_init<-list(alpha_rw2=matrix(rnorm(n*S,0,1),ncol=S),
+                    beta_rw1=array(rnorm(n*D*S,0,0.1), dim=c(n,S,D)),
+                    y=matrix(rep(NA,n*S),ncol=S),
+                    z=array(NA,dim=c(n,S,D)),
+                    phi=matrix(rexp(D*S,0.1),ncol=D),
+                    pi=matrix(rnorm(D*S,0,1),ncol=D))
+  
+  
+  # SAVE GDM SAMPLES
+  pred_y_GDM<-list()
+  
+time_GDM <- system.time({
+ for(sims in 1:n_sims){
+    y <- test[[sims]]$y
+    long_y<-melt(y)
+    colnames(long_y)<-c("t","s","y")
+    z <- abind(test[[sims]]$z[,,1:D],test[[sims]]$y-apply((test[[sims]]$z[,,1:D]),c(1,2),sum), along=3)
+    
+# Set up data:
+Z<-z
+for(s in 1:S){
+  Z[,s,][outer(1:dim(Z[,s,])[1], 0:(dim(Z[,s,])[2]-1), FUN = "+") > n] <- NA
+}
+    
+    #data
+    Y<-apply(Z, c(1,2), sum)
+    Z<-Z[,,1:D]
+  nimble_data<-list(y=Y[1:n,], z=Z[1:n,,], time=time)
+  for(s in 1:S){
+    for(t in 1:n){
+      for(d in 1:D){
+        if(is.na(Z[t,s,d]))  nimble_init$z[t,s,d]=rpois(1,median(Z[,s,d],na.rm=T))
+      }
+      if(is.na(Y[t,s])) nimble_init$y[t,s]=sum(c(nimble_init$z[t,s,],Z[t,s,]),na.rm=TRUE)
+    }
+  }
+  
+  
+  # Build the model.
+  nimble_model <- nimbleModel(nimble_code2,
+                              constants=nimble_const,
+                              data=nimble_data,
+                              inits=nimble_init)
+  # Compile the model.
+  nimble_compiled_model <- compileNimble(nimble_model)
+  # Set up the MCMC.
+  nimble_mcmc_config <- configureMCMC(nimble_model,monitors=c('alpha_rw2','beta_rw1','lambda',
+                                                              'mu','y','theta','phi','pi', 'prec_alpha', 'prec_beta'))
+  nimble_mcmc<- buildMCMC(nimble_mcmc_config)
+  # Compile the MCMC.
+  nimble_compiled_mcmc <- compileNimble(nimble_mcmc,project=nimble_model)
+  #Run MCMC
+  nimble_samples<-as.mcmc.list(foreach(i=1:n_chains)%dopar%{runMCMC(nimble_compiled_mcmc,niter=n_iter,nburnin=n_burnin,inits=nimble_init,nchains=1,
+                                                                    samplesAsCodaMCMC = TRUE,thin=10)  })
+  combined_samples <- as.tibble(do.call('rbind',nimble_samples))
+    # # Nowcasts from NIMBLE
+     n_s<-nrow(combined_samples)
+    nimble_y<-  select(combined_samples,starts_with('y'))%>%as.matrix()%>%array(dim=c(n_s,n,S))
+    pred_y_3<-nimble_y%>%apply(c(2,3),quantile,c(0.025,0.5,0.975))%>%melt(varnames=c('quantile','t','s'),value.name='y')%>%spread(quantile,y)
+    
+    pred_y_GDM[[sims]]<-pred_y_3%>%mutate(Model="GDM NIMBLE")
+    colnames(pred_y_GDM[[sims]])[1:5]<-c("t","s","q025","Median","q975")
+    y <- test[[sims]]$y
+    long_y<-melt(y)
+    colnames(long_y)<-c("t","s","y")
+    pred_y_GDM[[sims]]<-full_join(pred_y_GDM[[sims]],long_y, by=c("t","s"))
+
+
+ }
+})
+##save(combined_samples, file="GDM_samples_sim1.RData")
+
+
+
+
+#save(pred_y_GDM,time_GDM ,file="GDM_predictions_sim1.RData")
+ggplot(data=pred_y_GDM[[1]])+  #geom_line(data=data.frame(t=1:n,y=lambda),aes(x=t,y=y))+
+  facet_wrap(~s, scales="free")+
+  geom_ribbon(aes(x=t,ymin=q025 ,ymax=q975, fill=Model),alpha=0.2)+
+  geom_line(aes(x=t,y=Median, colour=Model))+
+  geom_point(aes(x=t,y=y))+
+  labs(x='Time',y='y', caption='INLA NB of the partial counts')
+
+save(pred_y_GDM,time_GDM, file="GDM_predictions.RData")
+
+```
+
+
+```{r GDM plots, echo=FALSE}
+y_NB_approx<-y_NB_approx_GDM<-list()
+for(sims in 1:n_sims){
+y_NB_approx[[sims]]<-full_join(y_pred_NB[[sims]],y_pred_approx[[sims]], by=colnames(y_pred_NB))
+y_NB_approx_GDM[[sims]]<-full_join(y_NB_approx[[sims]],pred_y_GDM[[sims]], by=colnames(pred_y_GDM))
+y_NB_approx_GDM[[sims]]<-y_NB_approx_GDM[[sims]]%>%mutate(simulation=sims)
+}
+
+
+GDM.NB.approx<-ggplot(data=filter(y_NB_approx_GDM[[1]],t>C))+  #geom_line(data=data.frame(t=1:n,y=lambda),aes(x=t,y=y))+
+  facet_wrap(~s, scales="free")+
+  geom_ribbon(aes(x=t,ymin=q025 ,ymax=q975, fill=Model),alpha=0.2)+
+  geom_line(aes(x=t,y=Median, colour=Model))+
+  geom_point(aes(x=t,y=y))+
+  labs(x='Time',y='y', caption='INLA NB of the partial counts')
+GDM.NB.approx
+
+```
+
+## Compare all models
+
+All models fitted using rw1 simulated data
+
+```{r model compare, echo=FALSE}
+
+# phi values from simulation
+phi_values<-as.factor(test[[1]]$phi)
+#y_NB_approx_GDM$s<-phi_values[y_NB_approx_GDM$s]
+#y_NB_approx_GDM<-y_NB_approx_GDM[order(y_NB_approx_GDM$s),]
+# Compare nowcats:
+predicted_totals_NB_nolegend<-ggplot(data=filter(y_NB_approx_GDM[[78]], t>95))+ 
+  facet_wrap(~phi_values[s])+
+  geom_point( aes(x=t, y=y))+
+  geom_line( aes(x=t,y=Median, colour=Model))+
+  geom_ribbon(aes(x=t,ymin=q025,ymax=q975,colour=Model, fill=Model),linetype='dotted', alpha=0.25)+
+  # geom_ribbon(aes(x=c(1:n),ymin=y_pred$q025 ,ymax=y_pred$q975, fill='NB INLA', colour='NB INLA'),linetype='dotted', alpha=0.25)+
+  # geom_line(aes(x=c(1:n),y=y_pred$Median, colour='NB INLA'))+
+  #   geom_ribbon(aes(x=c(1:n),ymin=y_pred_2$q025 ,ymax=y_pred_2$q975, colour='GDM approximation INLA',fill='GDM approximation INLA'),linetype='dotted', alpha=0.25)+
+  # geom_line(aes(x=c(1:n),y=y_pred_2$Median, colour='GDM approximation INLA'))+
+  scale_colour_discrete(name='Model')+
+  scale_fill_discrete(name='Model')+
+  theme_light()+
+  theme(text = element_text(size=12), plot.title = element_text(size=16),plot.subtitle=element_text(size=14),
+        legend.title = element_text(size=12),strip.text = element_text(size=14), legend.position = "none")+
+  labs(x='Time (t)',y='Total counts (y)', 
+       title='Nowcasting performance comparison',
+       subtitle='Fitted to three simulated data sets with three Beta-Binomial variance parameter values')
+ggsave(predicted_totals_NB_nolegend, file='GDM_approx_NB_sim1.pdf', width=9, height=4)
+predicted_totals_NB_nolegend
+
+
+# Compare forecasts (no titles);
+GDM_approx_NB_simulations_notitle<-ggplot(data=filter(y_NB_approx_GDM[[38]], t>95))+ 
+  facet_wrap(~phi_values[s])+
+  geom_point( aes(x=t, y=y))+
+  geom_line( aes(x=t,y=Median, colour=Model))+
+  geom_ribbon(aes(x=t,ymin=q025,ymax=q975,colour=Model, fill=Model),linetype='dotted', alpha=0.25)+
+  # geom_ribbon(aes(x=c(1:n),ymin=y_pred$q025 ,ymax=y_pred$q975, fill='NB INLA', colour='NB INLA'),linetype='dotted', alpha=0.25)+
+  # geom_line(aes(x=c(1:n),y=y_pred$Median, colour='NB INLA'))+
+  #   geom_ribbon(aes(x=c(1:n),ymin=y_pred_2$q025 ,ymax=y_pred_2$q975, colour='GDM approximation INLA',fill='GDM approximation INLA'),linetype='dotted', alpha=0.25)+
+  # geom_line(aes(x=c(1:n),y=y_pred_2$Median, colour='GDM approximation INLA'))+
+  scale_colour_discrete(name='Model')+
+  scale_fill_discrete(name='Model')+
+  theme_light()+
+  theme(text = element_text(size=12), plot.title = element_text(size=16),plot.subtitle=element_text(size=14),
+        legend.title = element_text(size=12),strip.text = element_text(size=14), legend.position = "bottom")+
+  labs(x='Time (t)',y='Total counts (y)', 
+       title=NULL,
+       subtitle=NULL)
+ggsave(GDM_approx_NB_simulations_notitle, file='GDM_approx_NB_sim3.pdf', width=9, height=3.5)
+GDM_approx_NB_simulations_notitle
+
+# Compare forecasts (no titles);
+GDM_approx_NB_simulations_notitle_nolegend<-ggplot(data=filter(y_NB_approx_GDM[[10]], t>95))+ 
+  facet_wrap(~phi_values[s])+
+  geom_point( aes(x=t, y=y))+
+  geom_line( aes(x=t,y=Median, colour=Model))+
+  geom_ribbon(aes(x=t,ymin=q025,ymax=q975,colour=Model, fill=Model),linetype='dotted', alpha=0.25)+
+  # geom_ribbon(aes(x=c(1:n),ymin=y_pred$q025 ,ymax=y_pred$q975, fill='NB INLA', colour='NB INLA'),linetype='dotted', alpha=0.25)+
+  # geom_line(aes(x=c(1:n),y=y_pred$Median, colour='NB INLA'))+
+  #   geom_ribbon(aes(x=c(1:n),ymin=y_pred_2$q025 ,ymax=y_pred_2$q975, colour='GDM approximation INLA',fill='GDM approximation INLA'),linetype='dotted', alpha=0.25)+
+  # geom_line(aes(x=c(1:n),y=y_pred_2$Median, colour='GDM approximation INLA'))+
+  scale_colour_discrete(name='Model')+
+  scale_fill_discrete(name='Model')+
+  theme_light()+
+  theme(text = element_text(size=12), plot.title = element_text(size=16),plot.subtitle=element_text(size=14),
+        legend.title = element_text(size=12),strip.text = element_text(size=14), legend.position = "none")+
+  labs(x='Time (t)',y='Total counts (y)', 
+       title=NULL,
+       subtitle=NULL)
+ggsave(GDM_approx_NB_simulations_notitle_nolegend, file='GDM_approx_NB_sim2.pdf', width=9, height=3)
+GDM_approx_NB_simulations_notitle_nolegend
+
+
+```
+
+
+
+## Compare all models
+
+compare nowcasts using performance metrics:
+
+```{r model compare, echo=FALSE}
+
+# phi values from simulation
+phi_values<-as.factor(test[[1]]$phi)
+S<-length(phi_values)
+
+# One data frame for all simulations:
+GDM.NB.approx_unlist<-do.call("rbind", y_NB_approx_GDM)
+# just consider nowcasts 
+GDM.NB.approx_nowcasts<-GDM.NB.approx_unlist%>%filter(t>C)%>%mutate(
+                                             d=as.numeric(t-n))
+
+GDM.NB.approx_summary<-GDM.NB.approx_nowcasts%>%group_by(Model,d,s)%>%
+  summarise(Coverage=mean(y>=q025&y<=q975),
+            `Prediction interval width`=mean(q975-q025),
+            `Mean absolute error`=mean(abs(Median-y)))%>%
+  pivot_longer(cols=c('Coverage','Mean absolute error','Prediction interval width'),names_to = 'metric')%>%
+  mutate(
+  metric=factor(metric,levels=c('Mean absolute error','Prediction interval width','Coverage')))%>%
+  mutate(phi=paste('Phi=',phi_values[s],sep=''))
+GDM.NB.approx_summary<-GDM.NB.approx_summary%>%mutate(phi=factor(phi,levels=unique(GDM.NB.approx_summary$phi)))
+GDM.NB.approx_average<-GDM.NB.approx_summary%>%group_by(Model,d,metric)%>%
+  summarise(value.mean=mean(as.numeric(value)), value.median=median(as.numeric(value)))
+
+#Take the mean across different 
+GDM.NB.approx_average$value.mean[GDM.NB.approx_average$metric%in%c("Prediction Interval Width","Mean Absolute Error")]<-NA
+GDM.NB.approx_average$value.median[GDM.NB.approx_average$metric%in%c("Coverage")]<-NA
+GDM.NB.approx_average<-GDM.NB.approx_average%>%group_by(Model,d,metric)%>%mutate(value=sum(value.mean,value.median,na.rm=TRUE))
+
+# Compare models
+library(ggh4x)
+GDM.NB.approx_summary<-GDM.NB.approx_summary%>%mutate(yintercept=case_when(metric=="Coverage"~0.95))
+compare_models <- ggplot(filter(GDM.NB.approx_summary,d>-6))+
+  geom_line(aes(x=d,y=value,colour=Model),alpha=0.6)+
+  geom_point(aes(x=d,y=value,colour=Model,shape=Model),alpha=0.6)+
+  facet_grid2(phi~metric, scales = c("free"),independent = c("y"))+
+  #scale_colour_manual(name=NULL,values = c( "#4363D8", "#E6194B"))+
+#  scale_shape_manual(name=NULL,values=c(15,3))+
+  scale_x_continuous()+
+  labs(x='Prediction time difference',y=NULL,
+       title="Simulation experiment",
+       subtitle='Performance metrics for nowcast predictions')+
+  theme_light()+
+  geom_hline(data=GDM.NB.approx_summary,aes( yintercept = yintercept), colour="darkgrey")+
+  theme(legend.position = "bottom",text = element_text(size=12), plot.title = element_text(size=16),
+        plot.subtitle=element_text(size=14), legend.title = element_text(size=14),
+        strip.text = element_text(size=12))
+compare_models
+ggsave(compare_models, file="compare_approx_models.pdf", width=9, height=6)
+
+```
